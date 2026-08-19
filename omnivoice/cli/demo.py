@@ -395,6 +395,158 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                 )
 
             # ==============================================================
+            # Batch Voice Clone
+            # ==============================================================
+            with gr.TabItem("Batch Voice Clone"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        bvc_text = gr.Textbox(
+                            label="Text to Synthesize / 待合成文本",
+                            lines=4,
+                            placeholder="Enter the text you want to synthesize...",
+                        )
+                        bvc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
+                        
+                        gr.Markdown("### Reference Voices / 参考音频 (Up to 3)")
+                        
+                        with gr.Group():
+                            gr.Markdown("**Voice 1 / 声音 1**")
+                            bvc_ref_audio1 = gr.Audio(
+                                label="Reference Audio 1 / 参考音频 1",
+                                type="filepath",
+                                elem_classes="compact-audio",
+                            )
+                            bvc_ref_text1 = gr.Textbox(
+                                label="Reference Text 1 (optional) / 参考文本 1 (可选)",
+                                placeholder="Transcript of audio 1...",
+                            )
+                        
+                        with gr.Group():
+                            gr.Markdown("**Voice 2 / 声音 2**")
+                            bvc_ref_audio2 = gr.Audio(
+                                label="Reference Audio 2 / 参考音频 2",
+                                type="filepath",
+                                elem_classes="compact-audio",
+                            )
+                            bvc_ref_text2 = gr.Textbox(
+                                label="Reference Text 2 (optional) / 参考文本 2 (可选)",
+                                placeholder="Transcript of audio 2...",
+                            )
+                            
+                        with gr.Group():
+                            gr.Markdown("**Voice 3 / 声音 3**")
+                            bvc_ref_audio3 = gr.Audio(
+                                label="Reference Audio 3 / 参考音频 3",
+                                type="filepath",
+                                elem_classes="compact-audio",
+                            )
+                            bvc_ref_text3 = gr.Textbox(
+                                label="Reference Text 3 (optional) / 参考文本 3 (可选)",
+                                placeholder="Transcript of audio 3...",
+                            )
+
+                        with gr.Accordion("Instruct (optional)", open=False):
+                            bvc_instruct = gr.Textbox(label="Instruct", lines=2)
+                        (
+                            bvc_ns,
+                            bvc_gs,
+                            bvc_dn,
+                            bvc_sp,
+                            bvc_du,
+                            bvc_pp,
+                            bvc_po,
+                        ) = _gen_settings()
+                        bvc_btn = gr.Button("Generate All / Đồng loạt sinh giọng", variant="primary")
+                    with gr.Column(scale=1):
+                        bvc_audio1 = gr.Audio(
+                            label="Output Voice 1 / 合成结果 1",
+                            type="numpy",
+                        )
+                        bvc_audio2 = gr.Audio(
+                            label="Output Voice 2 / 合成结果 2",
+                            type="numpy",
+                        )
+                        bvc_audio3 = gr.Audio(
+                            label="Output Voice 3 / 合成结果 3",
+                            type="numpy",
+                        )
+                        bvc_status = gr.Textbox(label="Status / 状态", lines=4)
+
+                def _batch_clone_fn(
+                    text, lang, 
+                    ref_aud1, ref_text1, 
+                    ref_aud2, ref_text2, 
+                    ref_aud3, ref_text3, 
+                    instruct, ns, gs, dn, sp, du, pp, po
+                ):
+                    results = []
+                    statuses = []
+                    
+                    # Voice 1
+                    if ref_aud1:
+                        try:
+                            res1, stat1 = _gen(text, lang, ref_aud1, instruct, ns, gs, dn, sp, du, pp, po, mode="clone", ref_text=ref_text1 or None)
+                            results.append(res1)
+                            statuses.append(f"Voice 1: {stat1}")
+                        except Exception as e:
+                            results.append(None)
+                            statuses.append(f"Voice 1: Error: {e}")
+                    else:
+                        results.append(None)
+                        statuses.append("Voice 1: Skipped (no audio)")
+                        
+                    # Voice 2
+                    if ref_aud2:
+                        try:
+                            res2, stat2 = _gen(text, lang, ref_aud2, instruct, ns, gs, dn, sp, du, pp, po, mode="clone", ref_text=ref_text2 or None)
+                            results.append(res2)
+                            statuses.append(f"Voice 2: {stat2}")
+                        except Exception as e:
+                            results.append(None)
+                            statuses.append(f"Voice 2: Error: {e}")
+                    else:
+                        results.append(None)
+                        statuses.append("Voice 2: Skipped (no audio)")
+                        
+                    # Voice 3
+                    if ref_aud3:
+                        try:
+                            res3, stat3 = _gen(text, lang, ref_aud3, instruct, ns, gs, dn, sp, du, pp, po, mode="clone", ref_text=ref_text3 or None)
+                            results.append(res3)
+                            statuses.append(f"Voice 3: {stat3}")
+                        except Exception as e:
+                            results.append(None)
+                            statuses.append(f"Voice 3: Error: {e}")
+                    else:
+                        results.append(None)
+                        statuses.append("Voice 3: Skipped (no audio)")
+                        
+                    return results[0], results[1], results[2], "\n".join(statuses)
+
+                bvc_btn.click(
+                    _batch_clone_fn,
+                    inputs=[
+                        bvc_text,
+                        bvc_lang,
+                        bvc_ref_audio1,
+                        bvc_ref_text1,
+                        bvc_ref_audio2,
+                        bvc_ref_text2,
+                        bvc_ref_audio3,
+                        bvc_ref_text3,
+                        bvc_instruct,
+                        bvc_ns,
+                        bvc_gs,
+                        bvc_dn,
+                        bvc_sp,
+                        bvc_du,
+                        bvc_pp,
+                        bvc_po,
+                    ],
+                    outputs=[bvc_audio1, bvc_audio2, bvc_audio3, bvc_status],
+                )
+
+            # ==============================================================
             # Voice Design
             # ==============================================================
             with gr.TabItem("Voice Design"):
