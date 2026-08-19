@@ -230,10 +230,11 @@ def process_init(rank_queue, model_checkpoint, warmup=0, enable_flashinfer=False
 
     logging.info(f"Initializing worker on device: {worker_device}")
 
+    dtype = torch.float32 if worker_device == "cpu" else torch.float16
     worker_model = OmniVoice.from_pretrained(
         model_checkpoint,
         device_map=worker_device,
-        dtype=torch.float16,
+        dtype=dtype,
     )
 
     # Opt-in flashinfer acceleration. Applied here because workers are
