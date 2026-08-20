@@ -25,6 +25,10 @@ Usage:
 
 import argparse
 import logging
+import os
+import re
+import tempfile
+import zipfile
 from typing import Any, Dict
 
 import gradio as gr
@@ -144,6 +148,135 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def map_to_valid_instruct(emotion_str: str, guidance_str: str):
+    """
+    Maps freeform emotion/guidance keywords from script to valid OmniVoice attributes.
+    Ensures only attributes strictly supported by OmniVoice are passed.
+    """
+    from omnivoice.utils.voice_design import _INSTRUCT_ALL_VALID
+    
+    combined = f"{emotion_str} {guidance_str}".lower()
+    valid_tags = []
+    
+    # Style
+    if any(k in combined for k in ["whisper", "thì thầm", "耳语"]):
+        valid_tags.append("whisper")
+        
+    # Pitch / Energy
+    if any(k in combined for k in ["high energy", "energetic", "excited", "surprised", "high pitch", "cao trào", "vui vẻ", "ngạc nhiên", "sôi nổi"]):
+        valid_tags.append("high pitch")
+    elif any(k in combined for k in ["very high pitch", "hét", "screaming"]):
+        valid_tags.append("very high pitch")
+    elif any(k in combined for k in ["low pitch", "serious", "calm", "trầm", "nghiêm túc"]):
+        valid_tags.append("low pitch")
+    elif any(k in combined for k in ["very low pitch", "deep voice"]):
+        valid_tags.append("very low pitch")
+    elif any(k in combined for k in ["informative", "steady pace", "steady", "moderate pitch", "bình thường"]):
+        valid_tags.append("moderate pitch")
+        
+    # Age
+    if any(k in combined for k in ["child", "kid", "trẻ em", "em bé"]):
+        valid_tags.append("child")
+    elif any(k in combined for k in ["teenager", "teen", "thiếu niên"]):
+        valid_tags.append("teenager")
+    elif any(k in combined for k in ["elderly", "old", "người già", "ông lão", "bà lão"]):
+        valid_tags.append("elderly")
+    elif any(k in combined for k in ["young adult", "young", "trẻ"]):
+        valid_tags.append("young adult")
+        
+    # Gender
+    if any(k in combined for k in ["female", "woman", "girl", "nữ", "gái"]):
+        valid_tags.append("female")
+    elif any(k in combined for k in ["male", "man", "boy", "nam", "trai"]):
+        valid_tags.append("male")
+        
+    # Accents
+    if "japanese" in combined or "tiếng nhật" in combined:
+        valid_tags.append("japanese accent")
+    elif "british" in combined:
+        valid_tags.append("british accent")
+    elif "american" in combined:
+        valid_tags.append("american accent")
+    elif "chinese" in combined:
+        valid_tags.append("chinese accent")
+
+    filtered = []
+    for t in valid_tags:
+        if t in _INSTRUCT_ALL_VALID and t not in filtered:
+            filtered.append(t)
+    return ", ".join(filtered) if filtered else None
+
+
+def parse_script(script_text: str):
+    """
+    Parses a script of segments with timelines, text, emotions and instructions.
+    """
+    segments = []
+    lines = script_text.split('\n')
+    current_seg = None
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        time_match = re.match(r'\[#(\d+)\]\s*THỜI GIAN:\s*([\d\.]+)\s*->\s*([\d\.]+)', line, re.IGNORECASE)
+        if time_match:
+            if current_seg:
+                segments.append(current_seg)
+            seg_id = int(time_match.group(1))
+            start = float(time_match.group(2))
+            end = float(time_match.group(3))
+            current_seg = {
+                "id": seg_id,
+                "duration": round(end - start, 2),
+                "text": "",
+                "emotion": "",
+                "guidance": "",
+            }
+            continue
+            
+        if current_seg is None:
+            continue
+            
+        text_match = re.match(r'VĂN BẢN\s*(?:\([^)]+\))?:\s*(.+)', line, re.IGNORECASE)
+        if text_match:
+            current_seg["text"] = text_match.group(1).strip()
+            continue
+            
+        emotion_match = re.match(r'CẢM XÚC:\s*(.+)', line, re.IGNORECASE)
+        if emotion_match:
+            current_seg["emotion"] = emotion_match.group(1).strip()
+            continue
+            
+        guidance_match = re.match(r'HƯỚNG DẪN AI:\s*(.+)', line, re.IGNORECASE)
+        if guidance_match:
+            current_seg["guidance"] = guidance_match.group(1).strip()
+            continue
+            
+    if current_seg:
+        segments.append(current_seg)
+        
+    formatted_segs = []
+    for seg in segments:
+        instruct_parts = []
+        if seg["emotion"]:
+            instruct_parts.append(seg["emotion"])
+        if seg["guidance"]:
+            instruct_parts.append(seg["guidance"])
+            
+        valid_inst = map_to_valid_instruct(seg["emotion"], seg["guidance"])
+            
+        formatted_segs.append({
+            "id": seg["id"],
+            "duration": seg["duration"],
+            "text": seg["text"],
+            "raw_instruct": ", ".join(instruct_parts),
+            "valid_instruct": valid_inst
+        })
+    return formatted_segs
+
+
 # ---------------------------------------------------------------------------
 # Build demo
 # ---------------------------------------------------------------------------
@@ -171,6 +304,7 @@ def build_demo(
         postprocess_output,
         mode,
         ref_text=None,
+        voice_clone_prompt=None,
     ):
         if not text or not text.strip():
             return None, "Please enter the text to synthesize."
@@ -195,12 +329,15 @@ def build_demo(
             kw["duration"] = float(duration)
 
         if mode == "clone":
-            if not ref_audio:
-                return None, "Please upload a reference audio."
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-            )
+            if voice_clone_prompt is not None:
+                kw["voice_clone_prompt"] = voice_clone_prompt
+            else:
+                if not ref_audio:
+                    return None, "Please upload a reference audio."
+                kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                )
 
         if instruct and instruct.strip():
             kw["instruct"] = instruct.strip()
@@ -400,50 +537,41 @@ by Xiaomi AI Lab Next-gen Kaldi team.
             with gr.TabItem("Batch Voice Clone"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        bvc_text = gr.Textbox(
-                            label="Text to Synthesize / 待合成文本",
-                            lines=4,
-                            placeholder="Enter the text you want to synthesize...",
-                        )
                         bvc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
                         
-                        gr.Markdown("### Reference Voices / 参考音频 (Up to 3)")
-                        
+                        gr.Markdown("### Shared Reference Voice / 共享参考声音")
                         with gr.Group():
-                            gr.Markdown("**Voice 1 / 声音 1**")
-                            bvc_ref_audio1 = gr.Audio(
-                                label="Reference Audio 1 / 参考音频 1",
+                            bvc_ref_audio = gr.Audio(
+                                label="Shared Reference Audio / 共享参考音频",
                                 type="filepath",
                                 elem_classes="compact-audio",
                             )
-                            bvc_ref_text1 = gr.Textbox(
-                                label="Reference Text 1 (optional) / 参考文本 1 (可选)",
-                                placeholder="Transcript of audio 1...",
+                            bvc_ref_text = gr.Textbox(
+                                label="Shared Reference Text (optional) / 共享参考文本（可选）",
+                                placeholder="Transcript of the reference audio. Leave empty to auto-transcribe.",
                             )
                         
-                        with gr.Group():
-                            gr.Markdown("**Voice 2 / 声音 2**")
-                            bvc_ref_audio2 = gr.Audio(
-                                label="Reference Audio 2 / 参考音频 2",
-                                type="filepath",
-                                elem_classes="compact-audio",
-                            )
-                            bvc_ref_text2 = gr.Textbox(
-                                label="Reference Text 2 (optional) / 参考文本 2 (可选)",
-                                placeholder="Transcript of audio 2...",
-                            )
-                            
-                        with gr.Group():
-                            gr.Markdown("**Voice 3 / 声音 3**")
-                            bvc_ref_audio3 = gr.Audio(
-                                label="Reference Audio 3 / 参考音频 3",
-                                type="filepath",
-                                elem_classes="compact-audio",
-                            )
-                            bvc_ref_text3 = gr.Textbox(
-                                label="Reference Text 3 (optional) / 参考文本 3 (可选)",
-                                placeholder="Transcript of audio 3...",
-                            )
+                        gr.Markdown("### Texts to Synthesize / 待合成文本 (Up to 5)")
+                        bvc_text1 = gr.Textbox(
+                            label="Text 1 / 文本 1",
+                            placeholder="Enter the text for Voice 1...",
+                        )
+                        bvc_text2 = gr.Textbox(
+                            label="Text 2 / 文本 2",
+                            placeholder="Enter the text for Voice 2...",
+                        )
+                        bvc_text3 = gr.Textbox(
+                            label="Text 3 / 文本 3",
+                            placeholder="Enter the text for Voice 3...",
+                        )
+                        bvc_text4 = gr.Textbox(
+                            label="Text 4 / 文本 4",
+                            placeholder="Enter the text for Voice 4...",
+                        )
+                        bvc_text5 = gr.Textbox(
+                            label="Text 5 / 文本 5",
+                            placeholder="Enter the text for Voice 5...",
+                        )
 
                         with gr.Accordion("Instruct (optional)", open=False):
                             bvc_instruct = gr.Textbox(label="Instruct", lines=2)
@@ -470,70 +598,85 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             label="Output Voice 3 / 合成结果 3",
                             type="numpy",
                         )
-                        bvc_status = gr.Textbox(label="Status / 状态", lines=4)
+                        bvc_audio4 = gr.Audio(
+                            label="Output Voice 4 / 合成结果 4",
+                            type="numpy",
+                        )
+                        bvc_audio5 = gr.Audio(
+                            label="Output Voice 5 / 合成结果 5",
+                            type="numpy",
+                        )
+                        bvc_status = gr.Textbox(label="Status / 状态", lines=5)
 
                 def _batch_clone_fn(
-                    text, lang, 
-                    ref_aud1, ref_text1, 
-                    ref_aud2, ref_text2, 
-                    ref_aud3, ref_text3, 
+                    lang, 
+                    ref_audio,
+                    ref_text,
+                    text1,
+                    text2,
+                    text3,
+                    text4,
+                    text5,
                     instruct, ns, gs, dn, sp, du, pp, po
                 ):
                     results = []
                     statuses = []
                     
-                    # Voice 1
-                    if ref_aud1:
-                        try:
-                            res1, stat1 = _gen(text, lang, ref_aud1, instruct, ns, gs, dn, sp, du, pp, po, mode="clone", ref_text=ref_text1 or None)
-                            results.append(res1)
-                            statuses.append(f"Voice 1: {stat1}")
-                        except Exception as e:
+                    if not ref_audio:
+                        return None, None, None, None, None, "Error: Please upload a shared reference audio."
+                    
+                    try:
+                        # Pre-generate clone prompt
+                        prompt = model.create_voice_clone_prompt(
+                            ref_audio=ref_audio,
+                            ref_text=ref_text or None,
+                        )
+                    except Exception as e:
+                        return None, None, None, None, None, f"Error encoding reference audio: {e}"
+                    
+                    texts = [text1, text2, text3, text4, text5]
+                    
+                    for i, t in enumerate(texts, 1):
+                        if t and t.strip():
+                            try:
+                                res, stat = _gen(
+                                    t.strip(),
+                                    lang,
+                                    ref_audio,
+                                    instruct,
+                                    ns,
+                                    gs,
+                                    dn,
+                                    sp,
+                                    du,
+                                    pp,
+                                    po,
+                                    mode="clone",
+                                    ref_text=ref_text or None,
+                                    voice_clone_prompt=prompt,
+                                )
+                                results.append(res)
+                                statuses.append(f"Voice {i}: {stat}")
+                            except Exception as e:
+                                results.append(None)
+                                statuses.append(f"Voice {i}: Error: {e}")
+                        else:
                             results.append(None)
-                            statuses.append(f"Voice 1: Error: {e}")
-                    else:
-                        results.append(None)
-                        statuses.append("Voice 1: Skipped (no audio)")
-                        
-                    # Voice 2
-                    if ref_aud2:
-                        try:
-                            res2, stat2 = _gen(text, lang, ref_aud2, instruct, ns, gs, dn, sp, du, pp, po, mode="clone", ref_text=ref_text2 or None)
-                            results.append(res2)
-                            statuses.append(f"Voice 2: {stat2}")
-                        except Exception as e:
-                            results.append(None)
-                            statuses.append(f"Voice 2: Error: {e}")
-                    else:
-                        results.append(None)
-                        statuses.append("Voice 2: Skipped (no audio)")
-                        
-                    # Voice 3
-                    if ref_aud3:
-                        try:
-                            res3, stat3 = _gen(text, lang, ref_aud3, instruct, ns, gs, dn, sp, du, pp, po, mode="clone", ref_text=ref_text3 or None)
-                            results.append(res3)
-                            statuses.append(f"Voice 3: {stat3}")
-                        except Exception as e:
-                            results.append(None)
-                            statuses.append(f"Voice 3: Error: {e}")
-                    else:
-                        results.append(None)
-                        statuses.append("Voice 3: Skipped (no audio)")
-                        
-                    return results[0], results[1], results[2], "\n".join(statuses)
+                            statuses.append(f"Voice {i}: Skipped (empty text)")
+                            
+                    return results[0], results[1], results[2], results[3], results[4], "\n".join(statuses)
 
                 bvc_btn.click(
                     _batch_clone_fn,
                     inputs=[
-                        bvc_text,
                         bvc_lang,
-                        bvc_ref_audio1,
-                        bvc_ref_text1,
-                        bvc_ref_audio2,
-                        bvc_ref_text2,
-                        bvc_ref_audio3,
-                        bvc_ref_text3,
+                        bvc_ref_audio,
+                        bvc_ref_text,
+                        bvc_text1,
+                        bvc_text2,
+                        bvc_text3,
+                        bvc_text4,
+                        bvc_text5,
                         bvc_instruct,
                         bvc_ns,
                         bvc_gs,
@@ -543,7 +686,198 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         bvc_pp,
                         bvc_po,
                     ],
-                    outputs=[bvc_audio1, bvc_audio2, bvc_audio3, bvc_status],
+                )
+
+            # ==============================================================
+            # Script Clone
+            # ==============================================================
+            with gr.TabItem("Script Clone / Sinh giọng theo Kịch bản"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        sc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
+                        
+                        gr.Markdown("### 1. Upload Shared Reference Voice / Tải lên giọng mẫu dùng chung")
+                        with gr.Group():
+                            sc_ref_audio = gr.Audio(
+                                label="Shared Reference Audio (Optional for Voice Cloning) / Giọng nói mẫu dùng chung (Tùy chọn)",
+                                type="filepath",
+                                elem_classes="compact-audio",
+                            )
+                            sc_ref_text = gr.Textbox(
+                                label="Shared Reference Text (optional) / Văn bản giọng mẫu (Tùy chọn)",
+                                placeholder="Leave empty to auto-transcribe.",
+                            )
+                        
+                        gr.Markdown("### 2. Paste Script / Dán Kịch bản timeline")
+                        sc_script = gr.Textbox(
+                            label="Script / Kịch bản",
+                            lines=12,
+                            placeholder="[#1] THỜI GIAN: 0.0 -> 5.0\nVĂN BẢN (JP): 日本のコンビニ...\nCẢM XÚC: Energetic\nHƯỚNG DẪN AI: High energy intro\n------------------------------------------",
+                            value="""BẢN TỔNG HỢP TIMELINE & HIỆU ỨNG ÂM THANH
+==========================================
+Thời lượng tổng: 30.0
+Số lượng phân đoạn: 5
+
+[#1] THỜI GIAN: 0.0 -> 5.0
+VĂN BẢN (JP): 日本のコンビニ、実は海外から見ると「魔法の場所」らしいよ。外国人がガチで衝撃を受けた3つのこと、紹介するね！
+HIỆU ỨNG (SFX): Paper tearing sound
+CẢM XÚC: Energetic
+HƯỚNG DẪN AI: High energy intro
+------------------------------------------
+[#2] THỜI GIAN: 5.0 -> 11.5
+VĂN BẢN (JP): 第3位、レジだけで生活が完結。公共料金の支払いから宅配の受け取りまで、何でもできちゃう。
+HIỆU ỨNG (SFX): Register 'ding'
+CẢM XÚC: Informative
+HƯỚNG DẪN AI: Steady pace
+------------------------------------------
+[#3] THỜI GIAN: 12.0 -> 19.5
+VĂN BẢN (JP): 第2位、深夜でも揚げたてフード。店員さんが作るチキンやおでん、クオリティ高すぎ！
+HIỆU ỨNG (SFX): Sizzling sound
+CẢM XÚC: Excited
+HƯỚNG DẪN AI: Emphasize 'quality'
+------------------------------------------
+[#4] THỜI GIAN: 20.0 -> 26.5
+VĂN BẢN (JP): そして第1位は、どこでも無料のトイレ。しかもピカピカ！これ、海外じゃマジで奇跡んだって。
+HIỆU ỨNG (SFX): Sparkle chime
+CẢM XÚC: Surprised
+HƯỚNG DẪN AI: Slow down for impact on 'miracle'
+------------------------------------------
+[#5] THỜI GIAN: 27.0 -> 30.0
+VĂN BẢN (JP): 旅行者には最高の味方だよね。日本のコンビニ、すごすぎない？
+HIỆU ỨNG (SFX): Pop
+CẢM XÚC: Friendly
+HƯỚNG DẪN AI: Ask a question for engagement
+------------------------------------------"""
+                        )
+                        
+                        (
+                            sc_ns,
+                            sc_gs,
+                            sc_dn,
+                            sc_sp,
+                            sc_du,
+                            sc_pp,
+                            sc_po,
+                        ) = _gen_settings()
+                        sc_btn = gr.Button("Generate Script / Sinh giọng theo kịch bản", variant="primary")
+                    with gr.Column(scale=1):
+                        sc_parsed_markdown = gr.Markdown(label="Parsed Script Summary / Tóm tắt kịch bản đã phân tích")
+                        
+                        sc_audio1 = gr.Audio(label="Segment 1 Output / Kết quả phân đoạn 1", type="numpy")
+                        sc_audio2 = gr.Audio(label="Segment 2 Output / Kết quả phân đoạn 2", type="numpy")
+                        sc_audio3 = gr.Audio(label="Segment 3 Output / Kết quả phân đoạn 3", type="numpy")
+                        sc_audio4 = gr.Audio(label="Segment 4 Output / Kết quả phân đoạn 4", type="numpy")
+                        sc_audio5 = gr.Audio(label="Segment 5 Output / Kết quả phân đoạn 5", type="numpy")
+                        
+                        sc_zip = gr.File(label="Download All WAVs (ZIP) / Tải xuống tất cả các tệp (ZIP)")
+                        sc_status = gr.Textbox(label="Status / Trạng thái", lines=5)
+
+                def _script_clone_fn(
+                    lang, 
+                    ref_audio,
+                    ref_text,
+                    script_text,
+                    ns, gs, dn, sp, du, pp, po
+                ):
+                    results = [None] * 5
+                    statuses = []
+                    
+                    if not script_text or not script_text.strip():
+                        return None, None, None, None, None, None, "", "Error: Script is empty."
+                    
+                    try:
+                        segments = parse_script(script_text)
+                    except Exception as e:
+                        return None, None, None, None, None, None, "", f"Error parsing script: {e}"
+                        
+                    if not segments:
+                        return None, None, None, None, None, None, "", "Error: No valid segments found in script. Please check the format."
+                    
+                    prompt = None
+                    if ref_audio:
+                        try:
+                            # Pre-generate clone prompt
+                            prompt = model.create_voice_clone_prompt(
+                                ref_audio=ref_audio,
+                                ref_text=ref_text or None,
+                            )
+                        except Exception as e:
+                            return None, None, None, None, None, None, "", f"Error encoding reference audio: {e}"
+                    
+                    mode = "clone" if (ref_audio and str(ref_audio).strip()) else "design"
+                    
+                    temp_dir = tempfile.mkdtemp()
+                    wav_paths = []
+                    
+                    parsed_summary = "### Parsed Segments:\n"
+                    for idx, seg in enumerate(segments):
+                        inst_display = f"*{seg['raw_instruct']}*" if seg['raw_instruct'] else ""
+                        mapped_display = f" [AI tag: `{seg['valid_instruct']}`]" if seg['valid_instruct'] else ""
+                        parsed_summary += f"- **Segment {seg['id']}** ({seg['duration']}s): {inst_display}{mapped_display} - \"{seg['text'][:30]}...\"\n"
+                    
+                    for idx, seg in enumerate(segments[:5]):
+                        seg_id = seg["id"]
+                        text = seg["text"]
+                        duration_val = seg["duration"]
+                        instruct_val = seg["valid_instruct"] # Use valid instruct mapped for OmniVoice
+                        
+                        try:
+                            res, stat = _gen(
+                                text,
+                                lang,
+                                ref_audio if (ref_audio and str(ref_audio).strip()) else None,
+                                instruct_val,
+                                ns,
+                                gs,
+                                dn,
+                                sp,
+                                duration_val,
+                                pp,
+                                po,
+                                mode,
+                                ref_text or None,
+                                prompt,
+                            )
+                            results[idx] = res
+                            statuses.append(f"Segment {seg_id}: {stat}")
+                            
+                            # Save to temp wave file for ZIP
+                            if res and res[1] is not None:
+                                import soundfile as sf
+                                wav_path = os.path.join(temp_dir, f"segment_{seg_id}.wav")
+                                sf.write(wav_path, res[1], res[0])
+                                wav_paths.append(wav_path)
+                                
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
+                            statuses.append(f"Segment {seg_id}: Error: {e}")
+                    
+                    zip_path = None
+                    if wav_paths:
+                        zip_path = os.path.join(temp_dir, "all_segments.zip")
+                        with zipfile.ZipFile(zip_path, 'w') as zipf:
+                            for wp in wav_paths:
+                                zipf.write(wp, os.path.basename(wp))
+                                
+                    return results[0], results[1], results[2], results[3], results[4], zip_path, parsed_summary, "\n".join(statuses)
+
+                sc_btn.click(
+                    _script_clone_fn,
+                    inputs=[
+                        sc_lang,
+                        sc_ref_audio,
+                        sc_ref_text,
+                        sc_script,
+                        sc_ns,
+                        sc_gs,
+                        sc_dn,
+                        sc_sp,
+                        sc_du,
+                        sc_pp,
+                        sc_po,
+                    ],
+                    outputs=[sc_audio1, sc_audio2, sc_audio3, sc_audio4, sc_audio5, sc_zip, sc_parsed_markdown, sc_status],
                 )
 
             # ==============================================================
