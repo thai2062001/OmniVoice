@@ -692,6 +692,10 @@ by Xiaomi AI Lab Next-gen Kaldi team.
             # Script Clone
             # ==============================================================
             with gr.TabItem("Script Clone / Sinh giọng theo Kịch bản"):
+                sc_page_state = gr.State(value=0)
+                sc_cache_state = gr.State(value={})
+                sc_temp_dir_state = gr.State(value="")
+
                 with gr.Row():
                     with gr.Column(scale=1):
                         sc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
@@ -719,7 +723,7 @@ Thời lượng tổng: 30.0
 Số lượng phân đoạn: 5
 
 [#1] THỜI GIAN: 0.0 -> 5.0
-VĂN BẢN (JP): 日本のコンビニ、実は海外から見ると「魔法の場所」らしいよ。外国人がガチで衝撃を受けた3つのこと、紹介するね！
+VĂN BẢN (JP): 日本のコンビニ、実は海外から見る「魔法の場所」らしいよ。外国人がガチで衝撃を受けた3つのこと、紹介するね！
 HIỆU ỨNG (SFX): Paper tearing sound
 CẢM XÚC: Energetic
 HƯỚNG DẪN AI: High energy intro
@@ -759,68 +763,87 @@ HƯỚNG DẪN AI: Ask a question for engagement
                             sc_pp,
                             sc_po,
                         ) = _gen_settings()
-                        sc_btn = gr.Button("Generate Script / Sinh giọng theo kịch bản", variant="primary")
+
+                        with gr.Row():
+                            sc_btn = gr.Button("▶ Sinh đợt này (5 phân đoạn)", variant="primary", scale=1)
+                            sc_next_btn = gr.Button("⏭ Tiếp tục đợt tiếp theo", variant="secondary", scale=1)
+                        sc_all_btn = gr.Button("⚡ Sinh TOÀN BỘ kịch bản", variant="stop")
                     with gr.Column(scale=1):
-                        sc_parsed_markdown = gr.Markdown(label="Parsed Script Summary / Tóm tắt kịch bản đã phân tích")
-                        
-                        sc_audio1 = gr.Audio(label="Segment 1 Output / Kết quả phân đoạn 1", type="numpy")
-                        sc_audio2 = gr.Audio(label="Segment 2 Output / Kết quả phân đoạn 2", type="numpy")
-                        sc_audio3 = gr.Audio(label="Segment 3 Output / Kết quả phân đoạn 3", type="numpy")
-                        sc_audio4 = gr.Audio(label="Segment 4 Output / Kết quả phân đoạn 4", type="numpy")
-                        sc_audio5 = gr.Audio(label="Segment 5 Output / Kết quả phân đoạn 5", type="numpy")
+                        with gr.Row():
+                            sc_prev_view_btn = gr.Button("◀ Đợt trước", size="sm", scale=1)
+                            sc_page_info = gr.Markdown("### 📑 Đang xem: Phân đoạn 1 - 5", elem_classes="text-center")
+                            sc_next_view_btn = gr.Button("Đợt sau ▶", size="sm", scale=1)
+
+                        sc_audio1 = gr.Audio(label="Segment 1 Output", type="numpy")
+                        sc_audio2 = gr.Audio(label="Segment 2 Output", type="numpy")
+                        sc_audio3 = gr.Audio(label="Segment 3 Output", type="numpy")
+                        sc_audio4 = gr.Audio(label="Segment 4 Output", type="numpy")
+                        sc_audio5 = gr.Audio(label="Segment 5 Output", type="numpy")
                         
                         sc_zip = gr.File(label="Download All WAVs (ZIP) / Tải xuống tất cả các tệp (ZIP)")
+                        sc_parsed_markdown = gr.Markdown(label="Parsed Script Summary / Tóm tắt kịch bản đã phân tích")
                         sc_status = gr.Textbox(label="Status / Trạng thái", lines=5)
 
-                def _script_clone_fn(
-                    lang, 
-                    ref_audio,
-                    ref_text,
-                    script_text,
-                    ns, gs, dn, sp, du, pp, po
+                def _generate_segments_core(
+                    lang, ref_audio, ref_text, script_text,
+                    ns, gs, dn, sp, du, pp, po,
+                    target_indices, current_page, all_cache, temp_dir
                 ):
-                    results = [None] * 5
-                    statuses = []
-                    
                     if not script_text or not script_text.strip():
-                        return None, None, None, None, None, None, "", "Error: Script is empty."
+                        return (
+                            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                            None, "", "Error: Script is empty.", "### 📑 Chưa có kịch bản",
+                            current_page, all_cache, temp_dir
+                        )
                     
                     try:
                         segments = parse_script(script_text)
                     except Exception as e:
-                        return None, None, None, None, None, None, "", f"Error parsing script: {e}"
+                        return (
+                            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                            None, "", f"Error parsing script: {e}", "### 📑 Lỗi phân tích",
+                            current_page, all_cache, temp_dir
+                        )
                         
                     if not segments:
-                        return None, None, None, None, None, None, "", "Error: No valid segments found in script. Please check the format."
+                        return (
+                            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                            None, "", "Error: No valid segments found.", "### 📑 Không tìm thấy phân đoạn",
+                            current_page, all_cache, temp_dir
+                        )
                     
+                    if all_cache is None:
+                        all_cache = {}
+                    
+                    if not temp_dir or not os.path.exists(temp_dir):
+                        temp_dir = tempfile.mkdtemp()
+
                     prompt = None
-                    if ref_audio:
+                    if ref_audio and str(ref_audio).strip():
                         try:
-                            # Pre-generate clone prompt
                             prompt = model.create_voice_clone_prompt(
                                 ref_audio=ref_audio,
                                 ref_text=ref_text or None,
                             )
                         except Exception as e:
-                            return None, None, None, None, None, None, "", f"Error encoding reference audio: {e}"
+                            return (
+                                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                                None, "", f"Error encoding reference audio: {e}", "### 📑 Lỗi giọng mẫu",
+                                current_page, all_cache, temp_dir
+                            )
                     
                     mode = "clone" if (ref_audio and str(ref_audio).strip()) else "design"
-                    
-                    temp_dir = tempfile.mkdtemp()
-                    wav_paths = []
-                    
-                    parsed_summary = "### Parsed Segments:\n"
-                    for idx, seg in enumerate(segments):
-                        inst_display = f"*{seg['raw_instruct']}*" if seg['raw_instruct'] else ""
-                        mapped_display = f" [AI tag: `{seg['valid_instruct']}`]" if seg['valid_instruct'] else ""
-                        parsed_summary += f"- **Segment {seg['id']}** ({seg['duration']}s): {inst_display}{mapped_display} - \"{seg['text'][:30]}...\"\n"
-                    
-                    for idx, seg in enumerate(segments[:5]):
+                    statuses = []
+
+                    for idx in target_indices:
+                        if idx >= len(segments):
+                            continue
+                        seg = segments[idx]
                         seg_id = seg["id"]
                         text = seg["text"]
                         duration_val = seg["duration"]
-                        instruct_val = seg["valid_instruct"] # Use valid instruct mapped for OmniVoice
-                        
+                        instruct_val = seg["valid_instruct"]
+
                         try:
                             res, stat = _gen(
                                 text,
@@ -838,46 +861,134 @@ HƯỚNG DẪN AI: Ask a question for engagement
                                 ref_text or None,
                                 prompt,
                             )
-                            results[idx] = res
+                            all_cache[idx] = (res, stat)
                             statuses.append(f"Segment {seg_id}: {stat}")
-                            
-                            # Save to temp wave file for ZIP
+
                             if res and res[1] is not None:
                                 import soundfile as sf
                                 wav_path = os.path.join(temp_dir, f"segment_{seg_id}.wav")
                                 sf.write(wav_path, res[1], res[0])
-                                wav_paths.append(wav_path)
-                                
                         except Exception as e:
                             import traceback
                             traceback.print_exc()
+                            all_cache[idx] = (None, f"Error: {e}")
                             statuses.append(f"Segment {seg_id}: Error: {e}")
-                    
+
+                    # Update zip file with all generated wavs in temp_dir
                     zip_path = None
-                    if wav_paths:
+                    wav_files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.endswith(".wav")]
+                    if wav_files:
                         zip_path = os.path.join(temp_dir, "all_segments.zip")
                         with zipfile.ZipFile(zip_path, 'w') as zipf:
-                            for wp in wav_paths:
+                            for wp in wav_files:
                                 zipf.write(wp, os.path.basename(wp))
-                                
-                    return results[0], results[1], results[2], results[3], results[4], zip_path, parsed_summary, "\n".join(statuses)
 
-                sc_btn.click(
-                    _script_clone_fn,
-                    inputs=[
-                        sc_lang,
-                        sc_ref_audio,
-                        sc_ref_text,
-                        sc_script,
-                        sc_ns,
-                        sc_gs,
-                        sc_dn,
-                        sc_sp,
-                        sc_du,
-                        sc_pp,
-                        sc_po,
-                    ],
-                    outputs=[sc_audio1, sc_audio2, sc_audio3, sc_audio4, sc_audio5, sc_zip, sc_parsed_markdown, sc_status],
+                    return _render_script_page(current_page, segments, all_cache, temp_dir, zip_path, "\n".join(statuses))
+
+                def _render_script_page(page_idx, segments, all_cache, temp_dir, zip_path, status_text=""):
+                    N = len(segments)
+                    P = max(1, (N + 4) // 5)
+                    page_idx = max(0, min(page_idx, P - 1))
+
+                    start_idx = page_idx * 5
+                    end_idx = min(start_idx + 5, N)
+
+                    audio_updates = []
+                    for slot in range(5):
+                        actual_idx = start_idx + slot
+                        if actual_idx < N:
+                            seg = segments[actual_idx]
+                            cached = all_cache.get(actual_idx, (None, ""))
+                            audio_val = cached[0]
+                            audio_label = f"Phân đoạn {seg['id']} ({seg['duration']}s): {seg['text'][:25]}..."
+                            audio_updates.append(gr.update(value=audio_val, label=audio_label, visible=True))
+                        else:
+                            audio_updates.append(gr.update(value=None, label="Trống", visible=False))
+
+                    parsed_summary = "### Parsed Segments Summary:\n"
+                    for idx, seg in enumerate(segments):
+                        is_current = (start_idx <= idx < end_idx)
+                        prefix = "👉 " if is_current else "- "
+                        done_icon = " ✅" if idx in all_cache and all_cache[idx][0] is not None else ""
+                        inst_display = f"*{seg['raw_instruct']}*" if seg['raw_instruct'] else ""
+                        mapped_display = f" [`{seg['valid_instruct']}`]" if seg['valid_instruct'] else ""
+                        parsed_summary += f"{prefix}**Segment {seg['id']}** ({seg['duration']}s): {inst_display}{mapped_display} - \"{seg['text'][:30]}...\"{done_icon}\n"
+
+                    page_info_md = f"### 📑 Đang xem: Phân đoạn {start_idx + 1} - {end_idx} / Tổng: {N} (Trang {page_idx + 1}/{P})"
+
+                    if not zip_path and temp_dir and os.path.exists(temp_dir):
+                        z = os.path.join(temp_dir, "all_segments.zip")
+                        if os.path.exists(z):
+                            zip_path = z
+
+                    return (
+                        audio_updates[0], audio_updates[1], audio_updates[2], audio_updates[3], audio_updates[4],
+                        zip_path, parsed_summary, status_text, page_info_md,
+                        page_idx, all_cache, temp_dir
+                    )
+
+                def _on_generate_current(lang, ref_audio, ref_text, script_text, ns, gs, dn, sp, du, pp, po, page_idx, all_cache, temp_dir):
+                    segments = parse_script(script_text) if script_text else []
+                    if not segments:
+                        return _render_script_page(0, [], {}, "", None, "Error: Script is empty.")
+                    start_idx = page_idx * 5
+                    target_indices = list(range(start_idx, min(start_idx + 5, len(segments))))
+                    return _generate_segments_core(lang, ref_audio, ref_text, script_text, ns, gs, dn, sp, du, pp, po, target_indices, page_idx, all_cache, temp_dir)
+
+                def _on_continue_next(lang, ref_audio, ref_text, script_text, ns, gs, dn, sp, du, pp, po, page_idx, all_cache, temp_dir):
+                    segments = parse_script(script_text) if script_text else []
+                    if not segments:
+                        return _render_script_page(0, [], {}, "", None, "Error: Script is empty.")
+                    N = len(segments)
+                    P = max(1, (N + 4) // 5)
+                    next_page = min(page_idx + 1, P - 1)
+                    start_idx = next_page * 5
+                    target_indices = list(range(start_idx, min(start_idx + 5, N)))
+                    return _generate_segments_core(lang, ref_audio, ref_text, script_text, ns, gs, dn, sp, du, pp, po, target_indices, next_page, all_cache, temp_dir)
+
+                def _on_generate_all(lang, ref_audio, ref_text, script_text, ns, gs, dn, sp, du, pp, po, page_idx, all_cache, temp_dir):
+                    segments = parse_script(script_text) if script_text else []
+                    if not segments:
+                        return _render_script_page(0, [], {}, "", None, "Error: Script is empty.")
+                    target_indices = list(range(len(segments)))
+                    return _generate_segments_core(lang, ref_audio, ref_text, script_text, ns, gs, dn, sp, du, pp, po, target_indices, page_idx, all_cache, temp_dir)
+
+                def _on_prev_view(script_text, page_idx, all_cache, temp_dir):
+                    segments = parse_script(script_text) if script_text else []
+                    new_page = max(0, page_idx - 1)
+                    return _render_script_page(new_page, segments, all_cache or {}, temp_dir, None, f"Đang xem trang {new_page + 1}")
+
+                def _on_next_view(script_text, page_idx, all_cache, temp_dir):
+                    segments = parse_script(script_text) if script_text else []
+                    N = len(segments)
+                    P = max(1, (N + 4) // 5)
+                    new_page = min(page_idx + 1, P - 1)
+                    return _render_script_page(new_page, segments, all_cache or {}, temp_dir, None, f"Đang xem trang {new_page + 1}")
+
+                gen_inputs = [
+                    sc_lang, sc_ref_audio, sc_ref_text, sc_script,
+                    sc_ns, sc_gs, sc_dn, sc_sp, sc_du, sc_pp, sc_po,
+                    sc_page_state, sc_cache_state, sc_temp_dir_state
+                ]
+                gen_outputs = [
+                    sc_audio1, sc_audio2, sc_audio3, sc_audio4, sc_audio5,
+                    sc_zip, sc_parsed_markdown, sc_status, sc_page_info,
+                    sc_page_state, sc_cache_state, sc_temp_dir_state
+                ]
+
+                sc_btn.click(_on_generate_current, inputs=gen_inputs, outputs=gen_outputs)
+                sc_next_btn.click(_on_continue_next, inputs=gen_inputs, outputs=gen_outputs)
+                sc_all_btn.click(_on_generate_all, inputs=gen_inputs, outputs=gen_outputs)
+
+                sc_prev_view_btn.click(
+                    _on_prev_view,
+                    inputs=[sc_script, sc_page_state, sc_cache_state, sc_temp_dir_state],
+                    outputs=gen_outputs
+                )
+                sc_next_view_btn.click(
+                    _on_next_view,
+                    inputs=[sc_script, sc_page_state, sc_cache_state, sc_temp_dir_state],
+                    outputs=gen_outputs
                 )
 
             # ==============================================================
